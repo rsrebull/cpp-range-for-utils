@@ -1,0 +1,413 @@
+#pragma once
+#ifndef FOR_RANGE_UTILS
+#define FOR_RANGE_UTILS
+
+/**
+ * @file   for_range_utils.h
+ * @author Ricard Sierra Rebull <ricard.sierra@gmail.com>
+ * @brief  Classes based in the Pyhton language to be used in range-for statements.
+ *
+ * Licensed under the MIT License <http://opensource.org/licenses/MIT>.
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2019 Ricard Sierra Rebull <ricard.sierra@gmail.com>.
+ *
+ * Permission is hereby  granted, free of charge, to any  person obtaining a copy
+ * of this software and associated  documentation files (the "Software"), to deal
+ * in the Software  without restriction, including without  limitation the rights
+ * to  use, copy,  modify, merge,  publish, distribute,  sublicense, and/or  sell
+ * copies  of  the Software,  and  to  permit persons  to  whom  the Software  is
+ * furnished to do so, subject to the following conditions:
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ * THE SOFTWARE  IS PROVIDED "AS  IS", WITHOUT WARRANTY  OF ANY KIND,  EXPRESS OR
+ * IMPLIED,  INCLUDING BUT  NOT  LIMITED TO  THE  WARRANTIES OF  MERCHANTABILITY,
+ * FITNESS FOR  A PARTICULAR PURPOSE AND  NONINFRINGEMENT. IN NO EVENT  SHALL THE
+ * AUTHORS  OR COPYRIGHT  HOLDERS  BE  LIABLE FOR  ANY  CLAIM,  DAMAGES OR  OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF  CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE  OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+#include <type_traits>
+#include <limits>
+#include <stdexcept>
+#include <regex>
+#include <map>
+
+#define ISOCPP11_VERSION 201103L
+#define ISOCPP14_VERSION 201402L
+#define ISOCPP17_VERSION 201703L
+
+#if __cplusplus   < ISOCPP11_VERSION
+#   error This file only compiles in a C++ compiler compliant with ISO C++11 standard.
+#elif __cplusplus < ISOCPP14_VERSION
+#   define CONSTEXPR    /*nothing*/
+#else
+#   define CONSTEXPR    constexpr
+#endif
+
+/*
+ * Definition of utility classes to be used in range for expressions to iterate
+ * over several sequences.
+ *
+ * Thanks to the function call like syntax of the object construction the defined types
+ * can be used as function calls in a range for expression.
+ *
+ * The defined types are:
+ * - iota<T>( stop )
+ * - iota<T>( start, stop [, step])
+ *      Generate a sequence of integral values starting in 0, or start value, till stop value es reached.
+ *      The stop value is not generated.
+ *      A increment/decrement value can be specified with the step parameter, by default is 1.
+ * - range( stop )
+ * - range( start, stop[, step])
+ *      Python-like range function, equivalent to iota<int>.
+ * - string_split( str, re [, re_flags] )
+ *      A wrapper over sregex_token_iterator to iterate over the tokens separated by the sequence of chars matching
+ *      the regular expression 're'. The flags defining the matching process can be specified.
+ * - map_keys<K,V>( map )
+ * - map_keys( map )        (since C++17)
+ *      Iterate over the keys of the given map.
+ * - map_values<K,V>( map )
+ * - map_values( map )      (since C++17)
+ *      Iterate over the values of the given map.
+ */
+
+namespace rfu
+{
+
+/*
+ * The iota<> class allows iterating in a range-for loop through a sequence of integral values
+ * starting at zero, or the specified 'start' value, till (not included) a given 'stop' value.
+ * The iterated values will be incremented by 1 unless specified in the 'step' param.
+ * No values will be generated if:
+ * - the starting value is greater or equal to the stop value when the step is positive,
+ * - the starting value is less or equal to the stop value when the step is negative.
+ * An std::invalid_argument exception is thrown if the 'step' value is zero.
+ *
+ * usage:
+ *     // Print: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9
+ *     for (auto n : hpf::iota<int>(10))
+ *     {
+ *         printf("%d, ", n);
+ *     }
+ *     printf("\b\b\n");
+ *
+ *     // Print: 1, 2, 3, 4
+ *     for (auto n : hpf::iota<long>(1, 5))
+ *     {
+ *         printf("%ld, ", n);
+ *     }
+ *     printf("\b\b\n");
+ *
+ *     // Print: d, c, b, a
+ *     for (auto c : std::iota<char>('d', 'a'-1, -1))
+ *     {
+ *         printf("%c, ", c);
+ *     }
+ *     printf("\b\b\n");
+ */
+template <typename T,
+    // Only allow integral types: bool, char, short, int, unsigned, long, etc.
+    typename = typename std::enable_if<std::is_integral<T>::value>::type>
+class iota final
+{
+private:
+    class iota_iterator final
+    {
+    public:
+        CONSTEXPR iota_iterator (T from, T step)
+        : count_{from}, step_{step} { if (step == 0) throw std::invalid_argument("'step' argument cannot be zero"); }
+
+        CONSTEXPR iota_iterator& operator++ () noexcept
+        { incr(std::integral_constant<bool,std::is_signed<T>::value>{}); return *this; }
+
+        constexpr T operator*() const noexcept
+        { return count_; }
+
+        // To work in for-ranges efficiently we define two iterators equal as
+        // any iterator with a value out of the iterating range values.
+        constexpr bool operator!= (iota_iterator it_other) const noexcept
+        { return operator_neq(it_other, std::integral_constant<bool,std::is_signed<T>::value>{}); }
+
+    private:
+        // Increment and comparison methods for unsigned value type.
+        CONSTEXPR void incr (std::false_type) noexcept
+        {
+            if (step_ == 1)
+            {
+                count_ += step_;
+            }
+            else
+            {
+                // clamp the increased value to the max valid value.
+                auto next_value = (std::numeric_limits<T>::max()-step_ < count_)? std::numeric_limits<T>::max() : count_ + step_;
+                count_ = next_value;
+            }
+        }
+
+        constexpr bool operator_neq (iota_iterator it_other, std::false_type) const noexcept
+        { return count_ < it_other.count_; }
+
+        // Increment and comparison methods for signed value type.
+        CONSTEXPR void incr (std::true_type) noexcept
+        {
+            if ((step_ == 1) or (step_ == -1))
+            {
+                count_ += step_;
+            }
+            else if (step_ < 0)
+            {
+                // clamp the increased value to the max valid value.
+                auto next_value = (count_ < std::numeric_limits<T>::min()-step_)? std::numeric_limits<T>::min() : count_ + step_;
+                count_ = next_value;
+            }
+            else
+            {
+                // clamp the increased value to the max valid value.
+                auto next_value = (std::numeric_limits<T>::max()-step_ < count_)? std::numeric_limits<T>::max() : count_ + step_;
+                count_ = next_value;
+            }
+        }
+
+        constexpr bool operator_neq (iota_iterator it_other, std::true_type) const noexcept
+        { return (step_ < 0)? (it_other.count_ < count_) : (count_ < it_other.count_); }
+
+    private:
+        T count_{0};
+        const T step_{1};
+    };
+
+public:
+    // forbid copy, move and asignment
+    iota (iota const&) = delete;
+    iota (iota &&) = delete;
+    iota& operator= (iota const&) = delete;
+    iota& operator= (iota &&) = delete;
+
+    constexpr explicit iota (T to) noexcept
+    : iota{0, to} {}
+
+    constexpr iota (T from, T to, T step = 1) noexcept
+    : from_{from}, to_{to}, step_{step} {}
+
+    constexpr iota_iterator begin() const
+    { return iota_iterator{from_, step_}; }
+
+    constexpr iota_iterator end() const
+    { return iota_iterator{to_, step_}; }
+
+private:
+    const T from_{0}, to_{0};
+    const T step_{1};
+};
+
+/*
+ * Python-like range() function defined as an spetialitzation of iota of int.
+ *
+ * usage:
+ *     // Print: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9
+ *     for (auto n : range(10))
+ *     {
+ *         printf("%d, ", n);
+ *     }
+ *     printf("\b\b\n");
+ *
+ *     // Print: 1, 2, 3, 4
+ *     for (auto n : range(1, 5))
+ *     {
+ *         printf("%d, ", n);
+ *     }
+ *     printf("\b\b\n");
+ *
+ *     // Print: 3, 2, 1
+ *     for (auto n : range(3, 0, -1))
+ *     {
+ *         printf("%d, ", n);
+ *     }
+ *     printf("\b\b\n");
+ */
+using range = iota<int>;
+
+
+/*
+ * The string_split class allows iterating in a range-for loop through a sequence of tokens (std::string) in a given
+ * string and separated by the specified regular expression.
+ *
+ * usage:
+ *      std::string str = "VALUE1::VALUE2::VALUE3";
+ *      for (auto&& value : hpf::string_split( str, std::regex{"::"} ))
+ *      {
+ *          puts( value.c_str() );
+ *      }
+ */
+class string_split final
+{
+private:
+    class string_split_iterator final
+    {
+    private:
+        std::sregex_token_iterator it_;
+
+    public:
+        string_split_iterator ()
+        = default;
+
+        string_split_iterator (const std::string& s, const std::regex& re, std::regex_constants::match_flag_type flags)
+        : it_{s.begin(), s.end(), re, -1, flags} {}
+
+        std::string operator* () const
+        { return it_->str(); }
+
+        string_split_iterator& operator++ ()
+        { ++it_; return *this; }
+
+        bool operator!= (const string_split_iterator& other) const
+        { return it_ != other.it_; }
+    };
+
+private:
+    const std::string str_;
+    const std::regex re_;
+    const std::regex_constants::match_flag_type re_flags_;
+
+public:
+    // forbid copy, move and asignment
+    string_split (string_split const&) = delete;
+    string_split (string_split &&) = delete;
+    string_split& operator= (string_split const&) = delete;
+    string_split& operator= (string_split &&) = delete;
+
+    string_split (const std::string& s, const std::regex& re, const std::regex_constants::match_flag_type& re_flags = std::regex_constants::match_default)
+    : str_{s}, re_{re}, re_flags_{re_flags} {}
+
+    string_split_iterator begin () const
+    { return string_split_iterator{str_, re_, re_flags_}; }
+
+    string_split_iterator end () const
+    { return string_split_iterator{}; }
+};
+
+/*
+ * The map_keys class allows iterating in a range-for loop through a sequence of keys contained in a given map.
+ * The sequence will be ordered.
+ *
+ * usage:
+ *     std::map<std::string, int> m {{"1s",1}, {"2s",2},{"3s",3}};
+ *     for (auto s : hpf::map_keys<std::string,int>(m))
+ *     {
+ *         printf("%s, ", s.c_str());
+ *     }
+ *
+ *  Since C++17:
+ *     std::map<std::string, int> m {{"1s",1}, {"2s",2},{"3s",3}};
+ *     for (auto s : hpf::map_keys(m))
+ *     {
+ *         printf("%s, ", s.c_str());
+ *     }
+ */
+template<typename K, typename V>
+class map_keys final
+{
+private:
+    struct map_keys_iterator final
+    {
+        typename std::map<K,V>::iterator it_;
+
+        K const& operator* () const noexcept
+        { return it_->first; }
+
+        map_keys_iterator& operator++ ()
+        { ++it_; return *this; }
+
+        bool operator!= (map_keys_iterator valuesIt) const
+        { return it_ != valuesIt.it_; }
+    };
+
+private:
+    std::map<K,V>& map_;
+
+public:
+    // forbid copy, move and asignment
+    map_keys (map_keys const&) = delete;
+    map_keys (map_keys &&) = delete;
+    map_keys& operator= (map_keys const&) = delete;
+    map_keys& operator= (map_keys &&) = delete;
+
+    explicit map_keys (std::map<K,V>& map) noexcept
+    : map_{map} {}
+
+    map_keys_iterator begin () const
+    { return map_keys_iterator{map_.begin()}; }
+
+    map_keys_iterator end () const
+    { return map_keys_iterator{map_.end()}; }
+};
+#if __cplusplus >= ISOCPP17_VERSION
+  template<typename K, typename V> map_keys(std::map<K,V>&) -> map_keys<K,V>;
+#endif
+
+
+/*
+ * The map_keys class allows iterating in a range-for loop through a sequence of values contained in a given map.
+ * The sequence will be ordered according the associated key values.
+ *
+ * usage:
+ *     std::map<std::string, int> m {{"1s",1}, {"2s",2},{"3s",3}};
+ *     for (auto n : hpf::map_values<std::string,int>(m))
+ *     {
+ *         printf("%d, ", n);
+ *     }
+ *
+ *  Since C++17:
+ *     std::map<std::string, int> m {{"1s",1}, {"2s",2},{"3s",3}};
+ *     for (auto n : hpf::map_values(m))
+ *     {
+ *         printf("%d, ", n);
+ *     }
+ */
+template<typename K, typename V>
+class map_values final
+{
+private:
+    struct map_values_iterator final
+    {
+        typename std::map<K,V>::iterator it_;
+
+        V& operator* ()
+        { return it_->second; }
+
+        map_values_iterator& operator++ ()
+        { ++it_; return *this; }
+
+        bool operator!= (map_values_iterator valuesIt) const
+        { return it_ != valuesIt.it_; }
+    };
+
+private:
+    std::map<K,V>& map_;
+
+public:
+    // forbid copy, move and asignment
+    map_values (map_values const&) = delete;
+    map_values (map_values &&) = delete;
+    map_values& operator= (map_values const&) = delete;
+    map_values& operator= (map_values &&) = delete;
+
+    explicit map_values(std::map<K,V>& map) noexcept
+    : map_{map} {}
+
+    map_values_iterator begin () const
+    { return map_values_iterator{map_.begin()}; }
+
+    map_values_iterator end () const
+    { return map_values_iterator{map_.end()}; }
+};
+#if __cplusplus >= ISOCPP17_VERSION
+  template<typename K, typename V> map_values(std::map<K,V>&) -> map_values<K,V>;
+#endif
+
+}
+
+#endif
+
